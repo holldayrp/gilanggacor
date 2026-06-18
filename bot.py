@@ -37,7 +37,8 @@ GMAIL_APP_PASSWORD  = "tmsbdmnfpfdchmyi"
 SERVER_NAME         = "Server Bahlil"
 IDLE_TIMEOUT        = 290
 CACHE_MAX           = 5000
-DEDUP_MAX           = 10000
+# FIX: DEDUP dihapus, diganti sistem timestamp
+OTP_RESEND_COOLDOWN = 30   # detik — OTP yang SAMA bisa dikirim ulang setelah 30 detik
 STARTER_PACK_SLOTS  = 10
 
 # ── PAYMENT ──
@@ -59,7 +60,7 @@ SLOT_EXPIRY_DAYS    = 0
 
 # ── IMAP THROTTLE ──
 POLL_INTERVAL       = 30
-SCAN_BATCH_DELAY    = 0.3
+SCAN_BATCH_DELAY    = 0.1   # FIX: dipercepat dari 0.3 → 0.1
 IDLE_BACKOFF_START  = 5
 IDLE_BACKOFF_MAX    = 120
 
@@ -159,7 +160,6 @@ def init_db():
                 (str(BONUS_SLOTS_PER_TOPUP),)
             )
             conn.commit()
-            print(f"🔧 Fixed bonus_slots_per_topup: 0 → {BONUS_SLOTS_PER_TOPUP}")
     except:
         pass
 
@@ -180,7 +180,6 @@ def init_db():
             )
         conn.execute("UPDATE bot_stats SET value='1' WHERE key='seeded_default_domains'")
         conn.commit()
-        print("✅ Default domains seeded to database.")
 
     conn.commit()
     conn.close()
@@ -189,7 +188,7 @@ init_db()
 
 def db():
     conn = sqlite3.connect(DB_NAME, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")  # FIX: WAL mode untuk concurrent access lebih aman
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 # ── USER ──
@@ -225,8 +224,27 @@ def get_valid_slots(user_id: int) -> int:
         ).fetchone()
     return row[0] if row else 0
 
-# FIX: Lock per-user untuk mencegah race condition saat create user
-_user_create_lock = threading.Lock()
+def repair_user_slots(user_id: int) -> int:
+    """
+    FIX SLOT HILANG: Sinkronkan users.slots dengan slot_batches.
+    Kolom users.slots adalah cache — kalau drift karena crash/race condition,
+    fungsi ini akan memperbaikinya secara otomatis.
+    """
+    current_wib_str = now_wib_str()
+    with db() as conn:
+        real_total = conn.execute(
+            "SELECT COALESCE(SUM(remaining),0) FROM slot_batches "
+            "WHERE user_id=? AND remaining>0 AND (expired_at IS NULL OR expired_at > ?)",
+            (user_id, current_wib_str)
+        ).fetchone()[0]
+        cached = conn.execute(
+            "SELECT slots FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if cached and cached[0] != real_total:
+            print(f"🔧 repair_user_slots: user {user_id} slots {cached[0]} -> {real_total} (drift diperbaiki)")
+            conn.execute("UPDATE users SET slots=? WHERE user_id=?", (real_total, user_id))
+            conn.commit()
+    return real_total
 
 def get_user_data(user_id):
     with db() as conn:
@@ -234,13 +252,11 @@ def get_user_data(user_id):
             "SELECT slots, email_count, otp_count FROM users WHERE user_id=?", (user_id,)
         ).fetchone()
         if not row:
-            # FIX: Gunakan INSERT OR IGNORE untuk atomic create, tidak perlu lock global
             conn.execute(
                 "INSERT OR IGNORE INTO users (user_id, slots, email_count, otp_count) VALUES (?,0,0,0)",
                 (user_id,)
             )
             conn.commit()
-            # Cek apakah ini benar-benar baru (tidak ada batch sebelumnya)
             batch_cnt = conn.execute(
                 "SELECT COUNT(*) FROM slot_batches WHERE user_id=?", (user_id,)
             ).fetchone()[0]
@@ -248,7 +264,8 @@ def get_user_data(user_id):
                 add_slot_batch(user_id, STARTER_PACK_SLOTS, "starterpack")
             return {"slots": get_valid_slots(user_id), "email_count": 0, "otp_count": 0}
     _migrate_legacy_slots(user_id)
-    valid = get_valid_slots(user_id)
+    # FIX SLOT HILANG: selalu sinkronkan dari slot_batches, bukan dari cache users.slots
+    valid = repair_user_slots(user_id)
     return {"slots": valid, "email_count": row[1], "otp_count": row[2] or 0}
 
 def _expiry_dt() -> str | None:
@@ -260,13 +277,27 @@ def _expiry_dt() -> str | None:
 def add_slot_batch(user_id: int, amount: int, source: str):
     exp = _expiry_dt()
     now = now_wib_str()
+    current_wib_str = now_wib_str()
     with db() as conn:
+        # Pastikan user row ada sebelum insert batch
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, slots, email_count, otp_count) VALUES (?,0,0,0)",
+            (user_id,)
+        )
         conn.execute(
             "INSERT INTO slot_batches (user_id,source,total,remaining,expired_at,created_at) "
             "VALUES (?,?,?,?,?,?)",
             (user_id, source, amount, amount, exp, now)
         )
-        conn.execute("UPDATE users SET slots=slots+? WHERE user_id=?", (amount, user_id))
+        # FIX: Sync users.slots dari slot_batches secara real-time
+        # Pakai SUM dari slot_batches sebagai sumber kebenaran,
+        # bukan += yang bisa drift jika ada crash/race condition
+        real_total = conn.execute(
+            "SELECT COALESCE(SUM(remaining),0) FROM slot_batches "
+            "WHERE user_id=? AND remaining>0 AND (expired_at IS NULL OR expired_at > ?)",
+            (user_id, current_wib_str)
+        ).fetchone()[0]
+        conn.execute("UPDATE users SET slots=? WHERE user_id=?", (real_total, user_id))
         conn.commit()
 
 def consume_slot_batch(user_id: int, count: int = 1):
@@ -291,7 +322,13 @@ def consume_slot_batch(user_id: int, count: int = 1):
                 "UPDATE slot_batches SET remaining=remaining-? WHERE id=?", (take, batch_id)
             )
             to_consume -= take
-        conn.execute("UPDATE users SET slots=slots-? WHERE user_id=?", (count, user_id))
+        # FIX: Sync users.slots dari slot_batches sebagai sumber kebenaran
+        real_total = conn.execute(
+            "SELECT COALESCE(SUM(remaining),0) FROM slot_batches "
+            "WHERE user_id=? AND remaining>0 AND (expired_at IS NULL OR expired_at > ?)",
+            (user_id, current_wib_str)
+        ).fetchone()[0]
+        conn.execute("UPDATE users SET slots=? WHERE user_id=?", (real_total, user_id))
         conn.commit()
     return True
 
@@ -440,18 +477,14 @@ def load_bonus_config():
                 )
                 conn.commit()
                 val = BONUS_SLOTS_PER_TOPUP
-                print(f"🔧 load_bonus_config: Fixed 0 → {val}")
             BONUS_SLOTS_PER_TOPUP = val
         except:
             BONUS_SLOTS_PER_TOPUP = 0
-    print(f"🎁 Bonus per topup: {BONUS_SLOTS_PER_TOPUP} slot")
 
 load_group_config()
 load_slot_expiry_config()
 load_bonus_config()
 
-# FIX: complete_order sekarang menggunakan transaksi DB yang atomic
-# mencegah double-credit jika polling berjalan concurrent
 def create_order(order_id, user_id, amount, slots, bonus, signature):
     with db() as conn:
         conn.execute(
@@ -463,14 +496,12 @@ def create_order(order_id, user_id, amount, slots, bonus, signature):
 
 def complete_order(order_id):
     with db() as conn:
-        # FIX: Gunakan UPDATE langsung dengan kondisi status='PENDING' — atomic, tidak perlu SELECT dulu
         cursor = conn.execute(
             "UPDATE topup_orders SET status='SUCCESS', paid_at=? "
             "WHERE order_id=? AND status='PENDING'",
             (now_wib_str(), order_id)
         )
         if cursor.rowcount == 0:
-            # Sudah diproses sebelumnya atau tidak ada
             conn.commit()
             return None, 0, 0
         row = conn.execute(
@@ -601,7 +632,6 @@ def update_domain_db(old_domain: str, new_domain: str) -> bool:
             )
             conn.commit()
 
-        # FIX: Snapshot dulu sebelum modifikasi dict — cegah RuntimeError: dict changed size during iteration
         with otp_lock:
             old_suffix = f"@{old_domain}"
             new_suffix = f"@{new_domain}"
@@ -614,11 +644,10 @@ def update_domain_db(old_domain: str, new_domain: str) -> bool:
                 if old_em in otp_history:
                     otp_history[new_em] = otp_history.pop(old_em)
 
-                # FIX: Buat set baru daripada modifikasi saat iterasi
-                otps_to_move = [k for k in sent_otp_set if k.startswith(f"{old_em}:")]
-                for k in otps_to_move:
-                    sent_otp_set.discard(k)
-                    sent_otp_set.add(k.replace(f"{old_em}:", f"{new_em}:", 1))
+                # FIX: Update timestamp dict juga
+                keys_ts = [k for k in otp_sent_timestamps if k.startswith(f"{old_em}:")]
+                for k in keys_ts:
+                    otp_sent_timestamps[k.replace(f"{old_em}:", f"{new_em}:", 1)] = otp_sent_timestamps.pop(k)
 
             for uid in list(user_emails.keys()):
                 user_emails[uid] = [
@@ -694,7 +723,6 @@ async def check_fb_checkpoint(email: str) -> str:
 # IMAP / OTP
 # ============================================================
 
-# FIX: auto_kill_existing yang lebih aman, tidak mematikan proses tak terkait
 def auto_kill_existing():
     current_pid = os.getpid()
     script_name = os.path.basename(__file__)
@@ -724,8 +752,35 @@ email_owners = {}
 user_state   = {}
 otp_lock     = threading.Lock()
 
-otp_history  = {}
-sent_otp_set = set()
+otp_history          = {}
+
+# ============================================================
+# FIX #1: Ganti sent_otp_set dengan timestamp dict
+# Tujuan: OTP kedua (atau OTP yang sama) bisa masuk setelah cooldown
+# ============================================================
+otp_sent_timestamps  = {}   # key: "email:otp" → timestamp (float) terakhir dikirim
+
+def _is_otp_on_cooldown(em: str, otp: str) -> bool:
+    """Cek apakah OTP ini masih dalam cooldown (belum boleh dikirim ulang)."""
+    key = f"{em}:{otp}"
+    last_sent = otp_sent_timestamps.get(key)
+    if last_sent is None:
+        return False
+    return (time.time() - last_sent) < OTP_RESEND_COOLDOWN
+
+def _mark_otp_sent(em: str, otp: str):
+    """Tandai OTP ini sudah dikirim, simpan timestamp-nya."""
+    key = f"{em}:{otp}"
+    otp_sent_timestamps[key] = time.time()
+
+def _cleanup_otp_timestamps():
+    """Hapus entry yang sudah melewati cooldown (hemat memori)."""
+    now_ts = time.time()
+    expired_keys = [k for k, ts in otp_sent_timestamps.items()
+                    if (now_ts - ts) > OTP_RESEND_COOLDOWN * 10]
+    for k in expired_keys:
+        otp_sent_timestamps.pop(k, None)
+# ============================================================
 
 _scan_lock = threading.Lock()
 _last_scan  = 0.0
@@ -771,26 +826,14 @@ def _warm_imap_pool():
     print(f"🔥 IMAP pool warmed ({len(_imap_pool)} koneksi)")
 
 def generate_random_email(domain):
-    # Kombinasi hanya huruf kecil (a-z) dan angka (0-9)
     alphanumeric = string.ascii_lowercase + string.digits
-    
     styles = [
-        # Gaya 1: Alfanumerik acak panjang (12-16 karakter) - Sangat aman dari tabrakan
         lambda: ''.join(secrets.choice(alphanumeric) for _ in range(random.randint(12, 16))),
-        
-        # Gaya 2: Huruf acak diikuti angka acak yang besar (6 digit)
         lambda: ''.join(random.choices(string.ascii_lowercase, k=random.randint(6, 8))) + str(secrets.randbelow(900000) + 100000),
-        
-        # Gaya 3: Angka acak di depan, diikuti huruf acak di belakang
         lambda: str(secrets.randbelow(90000) + 10000) + ''.join(random.choices(string.ascii_lowercase, k=random.randint(7, 9))),
-        
-        # Gaya 4: Huruf acak murni tetapi sangat panjang (11-15 karakter)
         lambda: ''.join(random.choices(string.ascii_lowercase, k=random.randint(11, 15))),
-        
-        # Gaya 5: Selang-seling blok huruf dan blok angka
         lambda: ''.join(random.choices(string.ascii_lowercase, k=5)) + str(secrets.randbelow(9000) + 1000) + ''.join(random.choices(string.ascii_lowercase, k=4))
     ]
-    
     username = random.choice(styles)()
     return f"{username}@{domain}"
 
@@ -844,8 +887,9 @@ def get_email_body(msg):
 
 def auto_cleanup():
     with otp_lock:
-        if len(otp_history) > CACHE_MAX: otp_history.clear()
-        if len(sent_otp_set) > DEDUP_MAX: sent_otp_set.clear()
+        if len(otp_history) > CACHE_MAX:
+            otp_history.clear()
+        _cleanup_otp_timestamps()
 
 def push_otp_to_cache(em: str, otp: str):
     em = em.lower()
@@ -883,7 +927,6 @@ def search_otp_with_conn(conn, target_email: str):
         except: continue
     return None
 
-# FIX: search_otp_fast — connection leak diperbaiki dengan try/finally yang lebih ketat
 def search_otp_fast(target_email: str):
     date_str = now_wib().strftime("%d-%b-%Y")
     folders  = ['INBOX', '"[Gmail]/All Mail"', '"[Gmail]/Spam"']
@@ -921,15 +964,13 @@ def search_otp_fast(target_email: str):
                 continue
     except Exception as e:
         print(f"search_otp_fast error: {e}")
-        # FIX: Jika error, jangan return conn ke pool — buat yang baru nanti
         if conn:
             try:
                 conn.logout()
             except:
                 pass
-        conn = None  # Tandai sudah di-close
+        conn = None
     finally:
-        # FIX: Hanya return ke pool jika conn masih valid (tidak di-close di except)
         if conn is not None:
             _return_imap(conn)
     return None
@@ -941,7 +982,6 @@ def _do_scan_all():
     found = 0
     try:
         conn = get_imap_connection()
-        # FIX: Snapshot email_owners dulu agar thread-safe saat iterasi
         with otp_lock:
             emails_snapshot = list(email_owners.keys())
         print(f"📬 Scanning {len(emails_snapshot)} emails...")
@@ -956,7 +996,6 @@ def _do_scan_all():
                 time.sleep(SCAN_BATCH_DELAY)
             except Exception as inner_e:
                 print(f"Scan single email error ({target_email}): {inner_e}")
-                # FIX: Reconnect jika koneksi mati di tengah scan
                 try:
                     conn.noop()
                 except:
@@ -1034,7 +1073,6 @@ def imap_poll_thread():
         except Exception as e: print(f"Poll error: {e}")
         time.sleep(POLL_INTERVAL)
 
-# FIX: slot_expiry_thread — tambahkan error handling yang lebih kuat
 def slot_expiry_thread():
     while True:
         time.sleep(3600)
@@ -1043,7 +1081,7 @@ def slot_expiry_thread():
             if affected > 0:
                 print(f"⏰ [WIB {now_wib_str()}] Slot expiry: {affected} user terdampak")
         except sqlite3.DatabaseError as e:
-            print(f"Expiry thread DB error: {e} — akan coba lagi 1 jam lagi")
+            print(f"Expiry thread DB error: {e}")
         except Exception as e:
             print(f"Expiry thread error: {e}")
 
@@ -1122,7 +1160,7 @@ async def send_not_member_message(update, context):
 def _check_admin(user_id): return user_id in ADMIN_IDS
 
 # ============================================================
-# OTP SEARCH (async) — FULLY OPTIMIZED
+# FIX #2: OTP SEARCH — Sistem baru dengan timestamp cooldown
 # ============================================================
 
 from concurrent.futures import ThreadPoolExecutor
@@ -1131,17 +1169,20 @@ _search_executor = ThreadPoolExecutor(max_workers=8)
 async def do_search_otp(em: str, edit_func, reply_markup_fn, user_id=None):
     em = em.strip().lower()
 
-    # FIX: Seluruh blok cek cache + tandai sent dilakukan dalam satu lock untuk atomicity
+    # ── Cek cache dulu ──
+    # FIX: Tidak pakai sent_otp_set, pakai timestamp cooldown
+    # Sehingga OTP kedua/baru BISA masuk setelah cooldown habis
     found_in_cache = None
     with otp_lock:
-        for otp in reversed(otp_history.get(em, [])):
-            sent_key = f"{em}:{otp}"
-            if sent_key not in sent_otp_set:
-                sent_otp_set.add(sent_key)  # Tandai sekarang, atomic
-                found_in_cache = otp
-                break
+        cached_otps = list(reversed(otp_history.get(em, [])))
+    
+    for otp in cached_otps:
+        if not _is_otp_on_cooldown(em, otp):
+            found_in_cache = otp
+            break
 
     if found_in_cache:
+        _mark_otp_sent(em, found_in_cache)
         if user_id:
             increment_otp_count(user_id)
         await safe_edit(edit_func, f"✅ *OTP Ditemukan!*\n\n📧 Email: `{em}`\n🔥 OTP: `{found_in_cache}`")
@@ -1152,18 +1193,20 @@ async def do_search_otp(em: str, edit_func, reply_markup_fn, user_id=None):
     loop = asyncio.get_running_loop()
 
     def _search():
-        # FIX: Cek cache dalam lock sebelum IMAP search
+        # Cek cache lagi di thread (mungkin sudah ada OTP baru dari scan paralel)
         with otp_lock:
-            for otp in reversed(otp_history.get(em, [])):
-                sent_key = f"{em}:{otp}"
-                if sent_key not in sent_otp_set:
-                    sent_otp_set.add(sent_key)
-                    return otp
+            cached_otps_now = list(reversed(otp_history.get(em, [])))
+        
+        for otp in cached_otps_now:
+            if not _is_otp_on_cooldown(em, otp):
+                _mark_otp_sent(em, otp)
+                return otp
+        
+        # Langsung IMAP search
         otp = search_otp_fast(em)
         if otp:
             push_otp_to_cache(em, otp)
-            with otp_lock:
-                sent_otp_set.add(f"{em}:{otp}")
+            _mark_otp_sent(em, otp)
         return otp
 
     otp = await loop.run_in_executor(_search_executor, _search)
@@ -1235,14 +1278,25 @@ async def _poll_payment(chat_id, user_id, order_id, paid_slots, order_bonus, amo
         trx_status = (data.get("status") or "PENDING").strip().upper()
         print(f"📊 [{order_id}] attempt {attempt+1}: {trx_status}")
         if trx_status in ("SUCCESS", "PAID"):
-            # FIX: complete_order sekarang atomic — tidak akan double credit
             uid, processed_slots, stored_bonus = complete_order(order_id)
+            # FIX: processed_slots dari DB adalah sumber kebenaran
+            # Kalau 0 berarti sudah diproses sebelumnya (race condition) — skip
             if processed_slots > 0:
+                # FIX: Pakai processed_slots dari DB, bukan paid_slots dari closure
+                # Ini mencegah mismatch jika closure menangkap nilai yang salah
                 actual_bonus = stored_bonus if stored_bonus > 0 else order_bonus
-                extended_batches = extend_user_slot_expiry(user_id)
-                total_to_add = paid_slots + actual_bonus
+                total_to_add = processed_slots + actual_bonus
+
+                # FIX: add_slot_batch DULU, baru extend_user_slot_expiry
+                # Sebelumnya: extend dipanggil sebelum add → slot baru tidak ikut di-extend
                 add_slot_batch(user_id, total_to_add, "topup")
+
+                # Extend SETELAH slot baru ditambahkan — semua batch (termasuk yang baru) ikut
+                extended_batches = extend_user_slot_expiry(user_id) if SLOT_EXPIRY_DAYS > 0 else 0
+
+                # Baca saldo SETELAH semua operasi selesai
                 udata = get_user_data(user_id)
+
                 bonus_line = f"🎁 Bonus   : `+{actual_bonus}` slot\n" if actual_bonus > 0 else ""
                 exp_line   = f"⏰ Berlaku : *{SLOT_EXPIRY_DAYS} hari*\n" if SLOT_EXPIRY_DAYS > 0 else ""
                 extend_line = ""
@@ -1252,23 +1306,22 @@ async def _poll_payment(chat_id, user_id, order_id, paid_slots, order_bonus, amo
                         f"🔄 Diperpanjang : `{extended_batches}` batch slot lama\n"
                         f"   → Expired baru: `{new_exp} WIB`\n"
                     )
-                elif SLOT_EXPIRY_DAYS > 0 and extended_batches == 0:
-                    extend_line = "🔄 Diperpanjang : tidak ada slot lama\n"
                 msg = (
                     "✅ *Pembayaran Diterima!*\n\n"
                     f"🆔 Order   : `{order_id}`\n"
                     f"💰 Nominal : Rp{amount:,}\n"
-                    f"📦 Slot +  : `{paid_slots}` slot\n"
+                    f"📦 Slot +  : `{processed_slots}` slot\n"
                     f"{bonus_line}"
                     f"➕ Total   : `+{total_to_add}` slot\n"
                     f"{exp_line}"
                     f"{extend_line}"
                     f"📦 Saldo   : `{udata['slots']}` slot\n\n"
-                    "💡 *Top up lagi untuk perpanjang slot yang sudah ada!*\n"
                     "Gunakan /getemail untuk mulai!"
                 )
+                print(f"✅ Topup OK: {order_id} → +{total_to_add} slot ke user {user_id} | saldo={udata['slots']}")
                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-                print(f"✅ Topup OK: {order_id} → +{total_to_add} slot (base={paid_slots}, bonus={actual_bonus}) ke {user_id} | extended {extended_batches} batches")
+            else:
+                print(f"⚠️ complete_order {order_id} returned 0 slots — sudah diproses sebelumnya, skip.")
             return
         if trx_status == "EXPIRED":
             expire_order(order_id)
@@ -1333,7 +1386,6 @@ async def _execute_broadcast(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     all_ids = get_all_user_ids()
     total   = len(all_ids)
 
-    # FIX: Hapus state SEBELUM eksekusi untuk mencegah broadcast ganda jika klik confirm dua kali
     user_state.pop(user_id, None)
 
     if total == 0:
@@ -1351,7 +1403,7 @@ async def _execute_broadcast(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             f"📋 Tipe  : {type_labels.get(bc_type, bc_type)}\n"
             f"👥 Total : `{total}` user\n\n"
             f"⏳ `[0/{total}]`\n"
-            f"{'█' * 0}{'░' * 20} 0%"
+            f"{'░' * 20} 0%"
         ),
         parse_mode="Markdown"
     )
@@ -1402,7 +1454,6 @@ async def _execute_broadcast(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         + (f"\n🚫 Blocked  : `{blocked}`" if blocked > 0 else ""),
         parse_mode="Markdown"
     )
-    print(f"📡 Broadcast selesai: ok={ok}, fail={fail}, blocked={blocked}, total={total}")
 
 # ============================================================
 # USER HANDLERS
@@ -1612,9 +1663,10 @@ async def deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for em in emails:
             em_lower = em.lower()
             otp_history.pop(em_lower, None)
-            # FIX: Buat set baru untuk avoid modifikasi saat iterasi
-            to_remove = {k for k in sent_otp_set if k.startswith(f"{em_lower}:")}
-            sent_otp_set.difference_update(to_remove)
+            # FIX: Hapus timestamp entries untuk email ini
+            ts_keys = [k for k in otp_sent_timestamps if k.startswith(f"{em_lower}:")]
+            for k in ts_keys:
+                otp_sent_timestamps.pop(k, None)
             email_owners.pop(em, None)
     user_emails[user_id] = []
     await update.message.reply_text(f"🗑️ *{count} email dihapus.*", parse_mode="Markdown")
@@ -1711,7 +1763,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             return
         if choice == "yes":
-            # FIX: Cek state dulu sebelum hapus — cegah double-execute jika tombol diklik dua kali
             if user_id not in user_state:
                 try:
                     await query.answer("⚠️ Broadcast sudah berjalan!", show_alert=True)
@@ -1763,6 +1814,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ *Akses Ditolak*\n\nJoin grup dulu ya!", parse_mode="Markdown", reply_markup=keyboard_join_group())
         return
 
+    # ============================================================
+    # FIX #3: Generate email PARALEL — semua email dikirim sekaligus
+    # Masalah lama: await reply satu per satu → terasa lambat & kadang
+    # pesan pertama saja yang muncul kalau ada error di tengah.
+    # Solusi: generate semua email dulu, consume slot sekaligus,
+    # lalu kirim semua reply secara paralel dengan asyncio.gather.
+    # ============================================================
     if state.get("state") == "waiting_count":
         if not text.isdigit():
             await update.message.reply_text("⚠️ *Masukkan angka saja!*\nContoh: `1`", parse_mode="Markdown")
@@ -1774,24 +1832,49 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if count == 0 or udata["slots"] <= 0:
             await update.message.reply_text("⛔ *Slot habis!* Gunakan /topup", parse_mode="Markdown")
             return
+
+        # Cek ulang slot yang tersedia setelah di-cap
+        available_slots = get_valid_slots(user_id)
+        count = min(count, available_slots)
+        if count <= 0:
+            await update.message.reply_text("⛔ *Slot habis!* Gunakan /topup", parse_mode="Markdown")
+            return
+
         await update.message.reply_text(f"⚡ *Membuat {count} email @{domain}...*", parse_mode="Markdown")
+
+        # Generate semua email sekaligus
+        generated_emails = []
+        for _ in range(count):
+            em = generate_random_email(domain)
+            generated_emails.append(em)
+
+        # Consume slot sekaligus (atomic)
+        ok = consume_slot_batch(user_id, count)
+        if not ok:
+            await update.message.reply_text("⛔ *Slot tidak cukup!* Gunakan /topup", parse_mode="Markdown")
+            return
+
+        # Daftarkan semua email ke memory
         if user_id not in user_emails:
             user_emails[user_id] = []
-        for i in range(count):
-            if get_user_data(user_id)["slots"] <= 0:
-                await update.message.reply_text("⛔ Slot habis!")
-                break
-            em = generate_random_email(domain)
-            user_emails[user_id].append(em)
-            with otp_lock:
+        with otp_lock:
+            for em in generated_emails:
+                user_emails[user_id].append(em)
                 email_owners[em] = user_id
-            consume_slot_batch(user_id, 1)
-            increment_email_count(user_id)
+                increment_email_count(user_id)
+
+        # Kirim semua pesan secara PARALEL
+        total = len(generated_emails)
+        async def _send_one(idx: int, em: str):
             await update.message.reply_text(
-                f"🚀 *{SERVER_NAME} {i+1}/{count}:*\n`{em}`\n📋 Tap untuk copy.",
+                f"🚀 *{SERVER_NAME} {idx+1}/{total}:*\n`{em}`\n📋 Tap untuk copy.",
                 parse_mode="Markdown",
                 reply_markup=keyboard_ambil_otp(em)
             )
+
+        await asyncio.gather(*[_send_one(i, em) for i, em in enumerate(generated_emails)])
+
+        # Trigger scan background
         threading.Thread(target=cache_all_emails_throttled, daemon=True).start()
         return
 
@@ -1942,7 +2025,6 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎁 Bonus/Topup  : {bonus_status}\n\n"
         f"━━━ *Pengaturan Slot* ━━━\n"
         f"⏰ Expired Slot : `{SLOT_EXPIRY_DAYS} hari` (0=permanen)\n"
-        f"🔄 Extend On Topup: `{'Aktif' if SLOT_EXPIRY_DAYS > 0 else 'Tidak aktif'}`\n"
         f"📡 Scan Interval: `{POLL_INTERVAL}s`\n"
         f"🔌 IMAP Pool    : `{_POOL_SIZE} koneksi`\n\n"
         "━━━ *Perintah Kelola* ━━━\n"
@@ -1958,12 +2040,8 @@ async def admin_setprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PRICE_PER_SLOT, TOPUP_MIN
     if len(context.args) < 1:
         await update.message.reply_text(
-            f"━━━ *Set Harga Slot* ━━━\n\n"
-            f"💰 Harga saat ini : `Rp{PRICE_PER_SLOT:,}` / slot\n"
-            f"📦 Min topup      : `Rp{TOPUP_MIN:,}`\n\n"
             f"Format:\n`/setprice <harga>` — ubah harga saja\n"
-            f"`/setprice <harga> <min>` — ubah harga + min topup\n\n"
-            f"Contoh:\n`/setprice 150`\n`/setprice 150 5000`",
+            f"`/setprice <harga> <min>` — ubah harga + min topup",
             parse_mode="Markdown"
         )
         return
@@ -1972,78 +2050,32 @@ async def admin_setprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(context.args) >= 2:
             TOPUP_MIN = int(context.args[1])
         await update.message.reply_text(
-            f"✅ *Harga diperbarui!*\n\n"
-            f"💰 Harga/Slot : `Rp{PRICE_PER_SLOT:,}`\n"
-            f"📦 Min Topup  : `Rp{TOPUP_MIN:,}`",
+            f"✅ Harga: `Rp{PRICE_PER_SLOT:,}` | Min: `Rp{TOPUP_MIN:,}`",
             parse_mode="Markdown"
         )
     except:
-        await update.message.reply_text("⚠️ Input invalid. Masukkan angka.", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Input invalid.", parse_mode="Markdown")
 
 async def admin_setbonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_admin(update.effective_user.id): return
     global BONUS_SLOTS_PER_TOPUP
     if not context.args:
-        if BONUS_SLOTS_PER_TOPUP > 0:
-            ex_amount = 5000
-            ex_slots  = ex_amount // PRICE_PER_SLOT
-            ex_total  = ex_slots + BONUS_SLOTS_PER_TOPUP
-            ex_text   = (
-                f"━━━ *Set Bonus Slot* ━━━\n\n"
-                f"🎁 Bonus saat ini : `+{BONUS_SLOTS_PER_TOPUP} slot` / topup\n"
-                f"💰 Harga/Slot     : `Rp{PRICE_PER_SLOT:,}`\n\n"
-                f"📊 *Contoh perhitungan:*\n"
-                f"Bayar `Rp{ex_amount:,}` → dapat `{ex_slots}` slot\n"
-                f"Bonus `+{BONUS_SLOTS_PER_TOPUP}` slot\n"
-                f"✨ Total dapat    : `{ex_total}` slot\n\n"
-                f"Format:\n`/setbonus <jumlah>`\n\n"
-                f"Contoh:\n`/setbonus 5` — bonus 5 slot per topup\n`/setbonus 0`  — nonaktifkan bonus"
-            )
-        else:
-            ex_text = (
-                f"━━━ *Set Bonus Slot* ━━━\n\n"
-                f"🎁 Bonus saat ini : `Nonaktif`\n"
-                f"💰 Harga/Slot     : `Rp{PRICE_PER_SLOT:,}`\n\n"
-                f"Format:\n`/setbonus <jumlah>`\n\n"
-                f"Contoh:\n`/setbonus 5` — bonus 5 slot per topup\n"
-                f"`/setbonus 10` — bonus 10 slot per topup\n`/setbonus 0`  — nonaktifkan bonus"
-            )
-        await update.message.reply_text(ex_text, parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🎁 Bonus saat ini: `{BONUS_SLOTS_PER_TOPUP}`\nFormat: `/setbonus <jumlah>`",
+            parse_mode="Markdown"
+        )
         return
     try:
         bonus = int(context.args[0])
-        if bonus < 0:
-            await update.message.reply_text("⚠️ Bonus tidak boleh negatif! Minimal `0`.", parse_mode="Markdown")
-            return
+        if bonus < 0: raise ValueError
     except ValueError:
-        await update.message.reply_text("⚠️ Masukkan angka yang valid!\nContoh: `/setbonus 5`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Masukkan angka >= 0.", parse_mode="Markdown")
         return
     BONUS_SLOTS_PER_TOPUP = bonus
     with db() as conn:
         conn.execute("UPDATE bot_stats SET value=? WHERE key='bonus_slots_per_topup'", (str(bonus),))
         conn.commit()
-    if bonus > 0:
-        ex_amount = 5000
-        ex_slots  = ex_amount // PRICE_PER_SLOT
-        ex_total  = ex_slots + bonus
-        msg = (
-            f"✅ *Bonus Slot Diperbarui!*\n\n"
-            f"🎁 Bonus/Topup : `+{bonus} slot`\n"
-            f"💰 Harga/Slot  : `Rp{PRICE_PER_SLOT:,}`\n\n"
-            f"📊 *Contoh perhitungan:*\n"
-            f"Bayar `Rp{ex_amount:,}` → dapat `{ex_slots}` slot\n"
-            f"Bonus `+{bonus}` slot\n"
-            f"✨ Total dapat    : `{ex_total}` slot\n\n"
-            f"💡 Bonus berlaku untuk *semua topup* ke depan."
-        )
-    else:
-        msg = (
-            f"✅ *Bonus Slot Dinonaktifkan!*\n\n"
-            f"🎁 Bonus/Topup : `Nonaktif`\n"
-            f"💰 Harga/Slot  : `Rp{PRICE_PER_SLOT:,}`\n\n"
-            f"User hanya mendapat slot sesuai nominal bayar."
-        )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Bonus: `+{bonus} slot/topup`", parse_mode="Markdown")
 
 async def admin_setexpiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global SLOT_EXPIRY_DAYS
@@ -2051,16 +2083,13 @@ async def admin_setexpiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         status = f"{SLOT_EXPIRY_DAYS} hari" if SLOT_EXPIRY_DAYS > 0 else "Permanen"
         await update.message.reply_text(
-            f"⏰ *Setting Expired Slot*\n\nStatus: *{status}*\n\n"
-            f"Format: `/setexpiry <hari>`\n`/setexpiry 30` → expired 30 hari\n`/setexpiry 0`  → permanen\n\n"
-            f"💡 *Saat expiry aktif, top up akan otomatis memperpanjang semua slot lama yang masih aktif.*",
+            f"⏰ Status: *{status}*\nFormat: `/setexpiry <hari>` | `0` = permanen",
             parse_mode="Markdown"
         )
         return
     try:
         days = int(context.args[0])
-        if days < 0:
-            raise ValueError
+        if days < 0: raise ValueError
     except ValueError:
         await update.message.reply_text("⚠️ Hari harus angka >= 0.", parse_mode="Markdown")
         return
@@ -2068,15 +2097,7 @@ async def admin_setexpiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         conn.execute("UPDATE bot_stats SET value=? WHERE key='slot_expiry_days'", (str(days),))
         conn.commit()
-    if days == 0:
-        msg = "✅ *Slot diset Permanen!*\n\nSlot baru tidak akan expired.\n🔄 Extend on topup dinonaktifkan."
-    else:
-        msg = (
-            f"✅ *Expired diperbarui!*\n\n"
-            f"⏰ Slot baru expired setelah *{days} hari (WIB)*\n"
-            f"🔄 *Top up akan memperpanjang semua slot lama yang masih aktif!*\n"
-            f"_(Slot yang sudah expired/remaining=0 tidak bisa diperpanjang)_"
-        )
+    msg = f"✅ Slot expired setelah *{days} hari*" if days > 0 else "✅ Slot diset *Permanen*"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def admin_runexpiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2084,8 +2105,7 @@ async def admin_runexpiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg      = await update.message.reply_text("⏳ *Menjalankan expired slot...*", parse_mode="Markdown")
     affected = expire_slots_now()
     await msg.edit_text(
-        f"✅ *Expired slot selesai!*\n\n👥 User terdampak: `{affected}`\n"
-        "Slot yang expired telah dihapus dari saldo user.",
+        f"✅ *Expired slot selesai!*\n\n👥 User terdampak: `{affected}`",
         parse_mode="Markdown"
     )
 
@@ -2098,48 +2118,29 @@ async def admin_fbstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         us_cnt = conn.execute("SELECT COUNT(*) FROM fb_checkpoint_log WHERE status='used'").fetchone()[0]
         er_cnt = conn.execute("SELECT COUNT(*) FROM fb_checkpoint_log WHERE status='error'").fetchone()[0]
     await update.message.reply_text(
-        "━━━━━━━━━━━━━━━━━\n   📊 *Statistik FB Checkpoint*\n━━━━━━━━━━━━━━━━━\n\n"
-        f"🔍 Total Dicek  : `{total}`\n✅ Aman         : `{ok_cnt}`\n"
-        f"⛔ Checkpoint   : `{cp_cnt}`\n⚠️ Sudah Dipakai: `{us_cnt}`\n❓ Error        : `{er_cnt}`",
+        f"📊 *FB Checkpoint Stats*\n\nTotal: `{total}` | ✅`{ok_cnt}` ⛔`{cp_cnt}` ⚠️`{us_cnt}` ❓`{er_cnt}`",
         parse_mode="Markdown"
     )
-
-# ── DYNAMIC DOMAIN ADMIN COMMANDS ──
 
 async def admin_adddomain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_admin(update.effective_user.id): return
     if not context.args:
         await update.message.reply_text(
-            "━━━ *Tambah Domain Baru* ━━━\n\n"
-            "Format:\n"
-            "`/adddomain <domain>` — tambah dengan label default\n"
-            "`/adddomain <domain> <label>` — tambah dengan label custom\n\n"
-            "Contoh:\n"
-            "`/adddomain surabaya.cfd`\n"
-            "`/adddomain surabaya.cfd 🔥 Server Surabaya`",
+            "Format: `/adddomain <domain> [label]`\nContoh: `/adddomain surabaya.cfd 🔥 Server Surabaya`",
             parse_mode="Markdown"
         )
         return
     domain = context.args[0].strip().lower()
     label  = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
     if not domain or "." not in domain:
-        await update.message.reply_text("⚠️ Domain tidak valid! Contoh: `surabaya.cfd`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Domain tidak valid!", parse_mode="Markdown")
         return
-    existing = get_domains(active_only=False)
-    if domain in existing:
+    if domain in get_domains(active_only=False):
         await update.message.reply_text(f"⚠️ Domain `{domain}` sudah ada!", parse_mode="Markdown")
         return
     ok = add_domain_db(domain, label)
     if ok:
-        display_label = label if label else f"@{domain}"
-        await update.message.reply_text(
-            f"✅ *Domain Berhasil Ditambahkan!*\n\n"
-            f"🌐 Domain: `{domain}`\n🏷️ Label : {display_label}\n"
-            f"📋 Slot  : Urutan {len(get_domains(active_only=False))}\n\n"
-            f"Domain langsung muncul di tombol /getemail!",
-            parse_mode="Markdown"
-        )
-        print(f"✅ Domain added: {domain} ({display_label})")
+        await update.message.reply_text(f"✅ Domain `{domain}` ditambahkan!", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Gagal menambahkan domain.", parse_mode="Markdown")
 
@@ -2148,34 +2149,15 @@ async def admin_deldomain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         domains = get_domains(active_only=False)
         lines = "\n".join([f"• `{d}`" for d in domains])
-        await update.message.reply_text(
-            "━━━ *Hapus Domain* ━━━\n\n"
-            f"Format: `/deldomain <domain>`\n\n📋 *Domain tersedia:*\n{lines}\n\n"
-            "⚠️ Domain yang dihapus tidak akan muncul di tombol lagi.\n"
-            "Email yang sudah dibuat tetap bisa ambil OTP.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"Format: `/deldomain <domain>`\n\n{lines}", parse_mode="Markdown")
         return
     domain = context.args[0].strip().lower()
-    all_domains = get_domains(active_only=False)
-    if domain not in all_domains:
+    if domain not in get_domains(active_only=False):
         await update.message.reply_text(f"❌ Domain `{domain}` tidak ditemukan.", parse_mode="Markdown")
         return
-    email_count = 0
-    with otp_lock:
-        for em in list(email_owners.keys()):
-            if em.lower().endswith(f"@{domain}"):
-                email_count += 1
     ok = del_domain_db(domain)
     if ok:
-        warning = ""
-        if email_count > 0:
-            warning = f"\n\n⚠️ Ada `{email_count}` email aktif di domain ini.\nOTP masih bisa diambil di sesi ini."
-        await update.message.reply_text(
-            f"✅ *Domain Dihapus!*\n\n🌐 `{domain}`{warning}",
-            parse_mode="Markdown"
-        )
-        print(f"🗑️ Domain deleted: {domain}")
+        await update.message.reply_text(f"✅ Domain `{domain}` dihapus!", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Gagal menghapus domain.", parse_mode="Markdown")
 
@@ -2185,19 +2167,12 @@ async def admin_changedomain(update: Update, context: ContextTypes.DEFAULT_TYPE)
         domains = get_domains(active_only=False)
         lines = "\n".join([f"• `{d}`" for d in domains])
         await update.message.reply_text(
-            "━━━ *Ubah Nama Domain* ━━━\n\n"
-            "Format: `/changedomain <domain_lama> <domain_baru>`\n\n"
-            f"📋 *Domain saat ini:*\n{lines}\n\n"
-            "Contah:\n`/changedomain bahlil.cfd surabaya.cfd`\n\n"
-            "⚠️ Email aktif akan otomatis ikut berubah domain-nya.",
+            f"Format: `/changedomain <lama> <baru>`\n\n{lines}",
             parse_mode="Markdown"
         )
         return
     old_domain = context.args[0].strip().lower()
     new_domain = context.args[1].strip().lower()
-    if not old_domain or not new_domain or "." not in new_domain:
-        await update.message.reply_text("⚠️ Format domain tidak valid!", parse_mode="Markdown")
-        return
     all_domains = get_domains(active_only=False)
     if old_domain not in all_domains:
         await update.message.reply_text(f"❌ Domain `{old_domain}` tidak ditemukan.", parse_mode="Markdown")
@@ -2207,12 +2182,7 @@ async def admin_changedomain(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     ok = update_domain_db(old_domain, new_domain)
     if ok:
-        await update.message.reply_text(
-            f"✅ *Domain Diubah!*\n\n❌ Lama: `{old_domain}`\n✅ Baru: `{new_domain}`\n\n"
-            f"Email aktif sudah otomatis diperbarui.",
-            parse_mode="Markdown"
-        )
-        print(f"🔄 Domain changed: {old_domain} → {new_domain}")
+        await update.message.reply_text(f"✅ `{old_domain}` → `{new_domain}`", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Gagal mengubah domain.", parse_mode="Markdown")
 
@@ -2226,45 +2196,68 @@ async def admin_listdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, d in enumerate(info):
         status = "🟢" if d["active"] else "🔴"
         label = get_domain_label(d["domain"])
-        lines.append(
-            f"{i+1}. {status} `{d['domain']}`\n   🏷️ {label} | 📋 Order: {d['sort_order']}"
-        )
+        lines.append(f"{i+1}. {status} `{d['domain']}` — {label}")
     await update.message.reply_text(
-        "━━━━━━━━━━━━━━━━━\n   🌐 *Domain Management*\n━━━━━━━━━━━━━━━━━\n\n"
-        + "\n".join(lines) +
-        "\n\n━━━ *Perintah* ━━━\n"
-        "/adddomain <domain> [label]\n/deldomain <domain>\n"
-        "/changedomain <lama> <baru>\n/toggledomain <domain>\n"
-        "/setdomainname <domain> <label>",
+        "🌐 *Domain List*\n\n" + "\n".join(lines),
         parse_mode="Markdown"
     )
 
 async def admin_toggledomain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_admin(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text(
-            "━━━ *Toggle Domain* ━━━\n\n"
-            "Format: `/toggledomain <domain>`\n\n"
-            "Nonaktifkan domain tanpa menghapus data.\n"
-            "Domain mati tidak muncul di tombol /getemail.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Format: `/toggledomain <domain>`", parse_mode="Markdown")
         return
     domain = context.args[0].strip().lower()
     result = toggle_domain_db(domain)
     if result is None:
         await update.message.reply_text(f"❌ Domain `{domain}` tidak ditemukan.", parse_mode="Markdown")
         return
-    if result:
-        await update.message.reply_text(
-            f"🟢 *Domain Diaktifkan!*\n\n`{domain}` sekarang muncul di tombol.",
-            parse_mode="Markdown"
+    status = "🟢 Aktif" if result else "🔴 Nonaktif"
+    await update.message.reply_text(f"✅ Domain `{domain}` → {status}", parse_mode="Markdown")
+
+# ============================================================
+# ADMIN: REPAIR SLOTS
+# ============================================================
+
+async def admin_repairslots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _check_admin(update.effective_user.id): return
+    msg = await update.message.reply_text("Memeriksa & memperbaiki slot...", parse_mode="Markdown")
+
+    if context.args:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await msg.edit_text("User ID harus angka.", parse_mode="Markdown")
+            return
+        old_val = get_valid_slots(target_id)
+        new_val = repair_user_slots(target_id)
+        diff = new_val - old_val
+        sign = "+" if diff >= 0 else ""
+        result = (
+            "*Repair Slot Selesai!*\n\n"
+            + "User ID  : `" + str(target_id) + "`\n"
+            + "Sebelum  : `" + str(old_val) + "` slot\n"
+            + "Sesudah  : `" + str(new_val) + "` slot\n"
+            + "Selisih  : `" + sign + str(diff) + "` slot"
         )
-    else:
-        await update.message.reply_text(
-            f"🔴 *Domain Dinonaktifkan!*\n\n`{domain}` tidak muncul di tombol.\nData tetap tersimpan.",
-            parse_mode="Markdown"
-        )
+        await msg.edit_text(result, parse_mode="Markdown")
+        return
+
+    all_ids = get_all_user_ids()
+    fixed = 0
+    total = len(all_ids)
+    for uid in all_ids:
+        old_val = get_valid_slots(uid)
+        new_val = repair_user_slots(uid)
+        if old_val != new_val:
+            fixed += 1
+    result_all = (
+        "*Repair Semua User Selesai!*\n\n"
+        + "Total user  : `" + str(total) + "`\n"
+        + "Diperbaiki  : `" + str(fixed) + "` user\n"
+        + "Sudah benar : `" + str(total - fixed) + "` user"
+    )
+    await msg.edit_text(result_all, parse_mode="Markdown")
 
 # ============================================================
 # MAIN
@@ -2272,19 +2265,10 @@ async def admin_toggledomain(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def main():
     print(f"🚀 Starting GacorMail Bot... [WIB {now_wib_str()}]")
-    print(f"   Starter slots  : {STARTER_PACK_SLOTS}")
-    print(f"   Admins         : {ADMIN_IDS}")
-    print(f"   Price/slot     : Rp{PRICE_PER_SLOT}")
-    print(f"   Min topup      : Rp{TOPUP_MIN}")
-    print(f"   Bonus/topup    : +{BONUS_SLOTS_PER_TOPUP} slot")
-    print(f"   Poll interval  : {POLL_INTERVAL}s")
-    print(f"   Scan delay     : {SCAN_BATCH_DELAY}s/email")
-    print(f"   Slot expiry    : {SLOT_EXPIRY_DAYS} hari (0=permanen)")
-    print(f"   Extend on topup: {'Aktif' if SLOT_EXPIRY_DAYS > 0 else 'Tidak aktif'}")
-    print(f"   Broadcast V2   : Aktif (text/photo/video + preview + progress)")
+    print(f"   OTP Cooldown   : {OTP_RESEND_COOLDOWN}s")
     print(f"   IMAP Pool Size : {_POOL_SIZE} koneksi")
+    print(f"   Scan delay     : {SCAN_BATCH_DELAY}s/email")
     print(f"   Domains        : {', '.join(get_domains(active_only=False))}")
-    print(f"   DB Mode        : WAL (concurrent-safe)")
 
     auto_kill_existing()
 
@@ -2306,7 +2290,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── User Commands ──
     app.add_handler(CommandHandler("start",        start))
     app.add_handler(CommandHandler("getemail",     getemail))
     app.add_handler(CommandHandler("getotp",       getotp))
@@ -2318,7 +2301,6 @@ def main():
     app.add_handler(CommandHandler("fbcheckall",   cmd_fbcheck_bulk))
     app.add_handler(CommandHandler("myslots",      cmd_myslots))
 
-    # ── Admin Commands ──
     app.add_handler(CommandHandler("broadcast",      admin_broadcast))
     app.add_handler(CommandHandler("addslots",       admin_addslots))
     app.add_handler(CommandHandler("setslots",       admin_setslots))
@@ -2336,13 +2318,13 @@ def main():
     app.add_handler(CommandHandler("fbstats",        admin_fbstats))
     app.add_handler(CommandHandler("setexpiry",      admin_setexpiry))
     app.add_handler(CommandHandler("runexpiry",      admin_runexpiry))
+    app.add_handler(CommandHandler("repairslots",    admin_repairslots))
 
-    # ── Callback & Text & Media ──
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, media_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    print("✅ Bot jalan! ⚡ Zero Delay Mode")
+    print("✅ Bot jalan! ⚡")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
